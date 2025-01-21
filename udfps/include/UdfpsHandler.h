@@ -15,6 +15,8 @@ class UdfpsHandler {
     virtual void onFingerDown(uint32_t x, uint32_t y, float minor, float major) = 0;
     virtual void onFingerUp() = 0;
     virtual void cancel() = 0;
+    virtual void onAuthenticationSucceeded() {};
+    virtual void onAuthenticationFailed() {};
 };
 
 struct UdfpsHandlerFactory {

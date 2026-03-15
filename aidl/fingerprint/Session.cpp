@@ -355,6 +355,17 @@ void Session::notify(const fingerprint_msg_t* msg) {
             std::vector<int> enrollments;
             enrollments.push_back(msg->data.removed.finger.fid);
             mCb->onEnrollmentsRemoved(enrollments);
+#else
+            std::vector<int32_t> enrollments;
+            enrollments.reserve(NUM_FINGERS);
+            for (unsigned int i = 0; i < NUM_FINGERS; i++) {
+                int32_t fid = msg->data.removed.fingers[i].fid;
+                if (!fid) break;
+                ALOGD("onRemove(fid=%d)", fid);
+                enrollments.push_back(fid);
+            }
+            mCb->onEnrollmentsRemoved(enrollments);
+#endif
         } break;
         case FINGERPRINT_AUTHENTICATED: {
             ALOGD("onAuthenticated(fid=%d, gid=%d)", msg->data.authenticated.finger.fid,
@@ -387,6 +398,17 @@ void Session::notify(const fingerprint_msg_t* msg) {
                 mCb->onEnrollmentsEnumerated(enrollments);
                 enrollments.clear();
             }
+#else
+            std::vector<int32_t> enrollments;
+            enrollments.reserve(NUM_FINGERS);
+            for (unsigned int i = 0; i < NUM_FINGERS; i++) {
+                int32_t fid = msg->data.enumerated.fingers[i].fid;
+                if (!fid) break;
+                ALOGD("onEnumerate(fid=%d)", fid);
+                enrollments.push_back(fid);
+            }
+            mCb->onEnrollmentsEnumerated(enrollments);
+#endif
         } break;
     }
 }

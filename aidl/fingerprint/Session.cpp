@@ -21,10 +21,12 @@ void onClientDeath(void* cookie) {
     }
 }
 
-Session::Session(fingerprint_device_t* device, UdfpsHandler* udfpsHandler, int userId,
+Session::Session(fingerprint_device_t* device, rbs_fingerprint_device_t* rbsDevice,
+                 UdfpsHandler* udfpsHandler, int userId,
                  std::shared_ptr<ISessionCallback> cb, LockoutTracker lockoutTracker,
                  std::vector<SensorLocation> sensorLocations)
     : mDevice(device),
+      mRbsDevice(rbsDevice),
       mLockoutTracker(lockoutTracker),
       mUserId(userId),
       mCb(cb),
@@ -33,10 +35,31 @@ Session::Session(fingerprint_device_t* device, UdfpsHandler* udfpsHandler, int u
     mDeathRecipient = AIBinder_DeathRecipient_new(onClientDeath);
 
     auto path = std::format("/data/vendor_de/{}/fpdata/", userId);
-    mDevice->set_active_group(mDevice, mUserId, path.c_str());
+    if (mRbsDevice) {
+        ALOGI("setActiveGroup (RBS)");
+        int rc = mRbsDevice->rbs_active_user_group(userId, path.c_str());
+        if (rc != 0) {
+            ALOGE("rbs_active_user_group failed, error: %d", rc);
+        }
+        rc = mRbsDevice->rbs_set_data_path(1, path.c_str());
+        if (rc != 0) {
+            ALOGE("rbs_set_data_path failed, error: %d", rc);
+        }
+    } else if (mDevice) {
+        mDevice->set_active_group(mDevice, mUserId, path.c_str());
+    }
 }
 
 ndk::ScopedAStatus Session::generateChallenge() {
+    if (mRbsDevice) {
+        mChallenge = static_cast<uint64_t>(rand()) | (static_cast<uint64_t>(rand()) << 32);
+        int rc = mRbsDevice->rbs_pre_enroll(mUserId, 10);
+        if (rc != 0) {
+            ALOGE("rbs_pre_enroll failed in generateChallenge: %d", rc);
+        }
+        mCb->onChallengeGenerated(mChallenge);
+        return ndk::ScopedAStatus::ok();
+    }
     uint64_t challenge = mDevice->pre_enroll(mDevice);
     ALOGI("generateChallenge: %ld", challenge);
     mCb->onChallengeGenerated(challenge);
@@ -45,6 +68,15 @@ ndk::ScopedAStatus Session::generateChallenge() {
 }
 
 ndk::ScopedAStatus Session::revokeChallenge(int64_t challenge) {
+    if (mRbsDevice) {
+        mChallenge = 0;
+        int rc = mRbsDevice->rbs_post_enroll();
+        if (rc != 0) {
+            ALOGE("rbs_post_enroll failed in revokeChallenge: %d", rc);
+        }
+        mCb->onChallengeRevoked(challenge);
+        return ndk::ScopedAStatus::ok();
+    }
     ALOGI("revokeChallenge: %ld", challenge);
     mDevice->post_enroll(mDevice);
     mCb->onChallengeRevoked(challenge);
@@ -54,6 +86,73 @@ ndk::ScopedAStatus Session::revokeChallenge(int64_t challenge) {
 
 ndk::ScopedAStatus Session::enroll(const HardwareAuthToken& hat,
                                    std::shared_ptr<ICancellationSignal>* out) {
+    if (mRbsDevice) {
+        hw_auth_token_t authToken;
+        translate(hat, authToken);
+
+        if (authToken.timestamp == 0) {
+            ALOGE("HAT timestamp is 0");
+            mCb->onError(Error::UNABLE_TO_PROCESS, 0);
+            *out = SharedRefBase::make<CancellationSignal>(this);
+            return ndk::ScopedAStatus::ok();
+        }
+
+        if (authToken.challenge != mChallenge) {
+            ALOGE("Challenge does not match: %ld vs %ld", authToken.challenge, mChallenge);
+            mCb->onError(Error::UNABLE_TO_PROCESS, 0);
+            *out = SharedRefBase::make<CancellationSignal>(this);
+            return ndk::ScopedAStatus::ok();
+        }
+
+        if (authToken.version != 0) {
+            ALOGE("Invalid HAT version = %d", (int)authToken.version);
+            mCb->onError(Error::UNABLE_TO_PROCESS, 0);
+            *out = SharedRefBase::make<CancellationSignal>(this);
+            return ndk::ScopedAStatus::ok();
+        }
+
+        int rc = mRbsDevice->rbs_chk_auth_token(&authToken, sizeof(hw_auth_token_t));
+        if (rc != 0) {
+            ALOGE("Auth token check failed, error %d", rc);
+            mCb->onError(Error::UNABLE_TO_PROCESS, rc);
+            *out = SharedRefBase::make<CancellationSignal>(this);
+            return ndk::ScopedAStatus::ok();
+        }
+
+        rc = mRbsDevice->rbs_chk_secure_id(mUserId, authToken.user_id);
+        if (rc != 0) {
+            ALOGD("Secure ID check failed, error %d", rc);
+            if (rc == 0x21) {
+                mRbsDevice->rbs_remove_fingerprint(mUserId, 0);
+                rc = mRbsDevice->rbs_chk_secure_id(mUserId, authToken.user_id);
+            }
+            if (rc != 0) {
+                ALOGE("Secure ID check failed after check/remove, error %d", rc);
+                mCb->onError(Error::UNABLE_TO_PROCESS, rc);
+                *out = SharedRefBase::make<CancellationSignal>(this);
+                return ndk::ScopedAStatus::ok();
+            }
+        }
+
+        rc = mRbsDevice->rbs_pre_enroll(mUserId, 10);
+        if (rc != 0) {
+            ALOGE("rbs_pre_enroll failed: %d", rc);
+        }
+        mRbsDevice->rbs_cancel(nullptr, 2);
+        if (mRbsDevice->rbs_extra_api) {
+            mRbsDevice->rbs_extra_api(3, nullptr, 0, nullptr, nullptr);
+        }
+
+        rc = mRbsDevice->rbs_enroll();
+        if (rc != 0) {
+            ALOGE("rbs_enroll failed: %d", rc);
+            mCb->onError(Error::UNABLE_TO_PROCESS, rc);
+        }
+
+        *out = SharedRefBase::make<CancellationSignal>(this);
+        return ndk::ScopedAStatus::ok();
+    }
+
     hw_auth_token_t authToken;
     translate(hat, authToken);
     int error = mDevice->enroll(mDevice, &authToken, mUserId, 60);
@@ -68,6 +167,23 @@ ndk::ScopedAStatus Session::enroll(const HardwareAuthToken& hat,
 
 ndk::ScopedAStatus Session::authenticate(int64_t operationId,
                                          std::shared_ptr<ICancellationSignal>* out) {
+    if (mRbsDevice) {
+        checkSensorLockout();
+        mRbsDevice->rbs_cancel(nullptr, 2);
+        mRbsDevice->rbs_cancel(nullptr, 3);
+        mRbsDevice->rbs_cancel(nullptr, 5);
+        int rc = mRbsDevice->rbs_authenticator(mUserId, nullptr, 0, operationId);
+        if (rc != 0) {
+            ALOGE("rbs_authenticator failed, error %d", rc);
+            mCb->onError(Error::CANCELED, 0);
+            if (rc == 4) {
+                mCb->onError(Error::HW_UNAVAILABLE, 0);
+            }
+        }
+        *out = SharedRefBase::make<CancellationSignal>(this);
+        return ndk::ScopedAStatus::ok();
+    }
+
     checkSensorLockout();
     int error = mDevice->authenticate(mDevice, operationId, mUserId);
     if (error) {
@@ -88,6 +204,23 @@ ndk::ScopedAStatus Session::detectInteraction(std::shared_ptr<ICancellationSigna
 }
 
 ndk::ScopedAStatus Session::enumerateEnrollments() {
+    if (mRbsDevice) {
+        uint32_t num_fids = 0;
+        uint32_t fids[5] = {};
+        int rc = mRbsDevice->rbs_get_fingerprint_ids(mUserId, fids, &num_fids);
+        if (rc != 0) {
+            ALOGE("RBS get_fingerprint_ids failed, error: %d", rc);
+            mCb->onError(Error::UNABLE_TO_PROCESS, rc);
+            return ndk::ScopedAStatus::ok();
+        }
+        std::vector<int32_t> enrollments;
+        for (uint32_t i = 0; i < num_fids; i++) {
+            enrollments.push_back(fids[i]);
+        }
+        mCb->onEnrollmentsEnumerated(enrollments);
+        return ndk::ScopedAStatus::ok();
+    }
+
     int error = mDevice->enumerate(mDevice);
     if (error) {
         ALOGE("enumerate failed: %d", error);
@@ -98,6 +231,41 @@ ndk::ScopedAStatus Session::enumerateEnrollments() {
 
 ndk::ScopedAStatus Session::removeEnrollments(const std::vector<int32_t>& enrollmentIds) {
     ALOGI("removeEnrollments, size: %zu", enrollmentIds.size());
+
+    if (mRbsDevice) {
+        if (enrollmentIds.empty()) {
+            uint32_t num_fids = 0;
+            uint32_t fids[5] = {};
+            int rc = mRbsDevice->rbs_get_fingerprint_ids(mUserId, fids, &num_fids);
+            if (rc == 0 && num_fids > 0) {
+                rc = mRbsDevice->rbs_remove_fingerprint(mUserId, 0);
+                if (rc == 0) {
+                    std::vector<int32_t> removedIds;
+                    for (uint32_t i = 0; i < num_fids; i++) {
+                        removedIds.push_back(fids[i]);
+                    }
+                    mCb->onEnrollmentsRemoved(removedIds);
+                } else {
+                    ALOGE("RBS remove failed, error: %d", rc);
+                    mCb->onError(Error::UNABLE_TO_REMOVE, rc);
+                }
+            } else {
+                mCb->onEnrollmentsRemoved({});
+            }
+        } else {
+            std::vector<int32_t> removedIds;
+            for (int32_t fid : enrollmentIds) {
+                int rc = mRbsDevice->rbs_remove_fingerprint(mUserId, fid);
+                if (rc == 0) {
+                    removedIds.push_back(fid);
+                } else {
+                    ALOGE("RBS remove failed for fid %d, error: %d", fid, rc);
+                }
+            }
+            mCb->onEnrollmentsRemoved(removedIds);
+        }
+        return ndk::ScopedAStatus::ok();
+    }
 
     if (enrollmentIds.empty()) {
         int error = mDevice->remove(mDevice, mUserId, 0);
@@ -116,6 +284,16 @@ ndk::ScopedAStatus Session::removeEnrollments(const std::vector<int32_t>& enroll
 }
 
 ndk::ScopedAStatus Session::getAuthenticatorId() {
+    if (mRbsDevice) {
+        uint64_t auth_id = 0;
+        int rc = mRbsDevice->rbs_get_authenticator_id(&auth_id);
+        if (rc != 0) {
+            ALOGE("RBS get_authenticator_id failed, error: %d", rc);
+        }
+        mCb->onAuthenticatorIdRetrieved(auth_id);
+        return ndk::ScopedAStatus::ok();
+    }
+
     uint64_t auth_id = mDevice->get_authenticator_id(mDevice);
     ALOGI("getAuthenticatorId: %ld", auth_id);
     mCb->onAuthenticatorIdRetrieved(auth_id);
@@ -123,6 +301,16 @@ ndk::ScopedAStatus Session::getAuthenticatorId() {
 }
 
 ndk::ScopedAStatus Session::invalidateAuthenticatorId() {
+    if (mRbsDevice) {
+        uint64_t new_auth_id = 0;
+        int rc = mRbsDevice->rbs_get_authenticator_id(&new_auth_id);
+        if (rc != 0) {
+            ALOGE("RBS get_authenticator_id failed, error: %d", rc);
+        }
+        mCb->onAuthenticatorIdInvalidated(new_auth_id);
+        return ndk::ScopedAStatus::ok();
+    }
+
     uint64_t auth_id = mDevice->get_authenticator_id(mDevice);
     ALOGI("invalidateAuthenticatorId: %ld", auth_id);
     mCb->onAuthenticatorIdInvalidated(auth_id);
@@ -141,12 +329,18 @@ ndk::ScopedAStatus Session::onPointerDown(int32_t /*pointerId*/, int32_t x, int3
     if (mUdfpsHandler) {
         mUdfpsHandler->onFingerDown(x, y, minor, major);
     }
+    if (mRbsDevice && mRbsDevice->rbs_extra_api) {
+        mRbsDevice->rbs_extra_api(1, nullptr, 0, nullptr, nullptr);
+    }
     return ndk::ScopedAStatus::ok();
 }
 
 ndk::ScopedAStatus Session::onPointerUp(int32_t /*pointerId*/) {
     if (mUdfpsHandler) {
         mUdfpsHandler->onFingerUp();
+    }
+    if (mRbsDevice && mRbsDevice->rbs_extra_api) {
+        mRbsDevice->rbs_extra_api(2, nullptr, 0, nullptr, nullptr);
     }
 
     return ndk::ScopedAStatus::ok();
@@ -210,14 +404,25 @@ ndk::ScopedAStatus Session::cancel() {
         mUdfpsHandler->cancel();
     }
 
-    int ret = mDevice->cancel(mDevice);
-
-    if (ret == 0) {
-        mCb->onError(Error::CANCELED, 0 /* vendorCode */);
+    if (mRbsDevice) {
+        mRbsDevice->rbs_cancel(nullptr, 2);
+        mRbsDevice->rbs_cancel(nullptr, 3);
+        mRbsDevice->rbs_cancel(nullptr, 5);
+        mCb->onError(Error::CANCELED, 0);
         return ndk::ScopedAStatus::ok();
     }
 
-    return ndk::ScopedAStatus::fromServiceSpecificError(ret);
+    if (mDevice) {
+        int ret = mDevice->cancel(mDevice);
+        if (ret == 0) {
+            mCb->onError(Error::CANCELED, 0 /* vendorCode */);
+            return ndk::ScopedAStatus::ok();
+        }
+        return ndk::ScopedAStatus::fromServiceSpecificError(ret);
+    }
+
+    mCb->onError(Error::CANCELED, 0);
+    return ndk::ScopedAStatus::ok();
 }
 
 ndk::ScopedAStatus Session::close() {

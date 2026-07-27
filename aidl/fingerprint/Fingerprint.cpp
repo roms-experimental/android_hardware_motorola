@@ -7,12 +7,13 @@
 
 #include "Fingerprint.h"
 
-#include <android-base/properties.h>
-#include <fingerprint.sysprop.h>
-#include "util/Util.h"
-
 #include <android-base/logging.h>
+#include <android-base/properties.h>
 #include <android-base/strings.h>
+#include <dlfcn.h>
+#include <fingerprint.sysprop.h>
+#include <unistd.h>
+#include "util/Util.h"
 
 namespace aidl::android::hardware::biometrics::fingerprint {
 
@@ -39,39 +40,44 @@ static const fingerprint_hal_t kModules[] = {
 static const uint16_t kVersion = HARDWARE_MODULE_API_VERSION(2, 1);
 static Fingerprint* sInstance;
 
-Fingerprint::Fingerprint(std::shared_ptr<FingerprintConfig> config) : mConfig(std::move(config)) {
+Fingerprint::Fingerprint(std::shared_ptr<FingerprintConfig> config)
+    : mConfig(std::move(config)), mDevice(nullptr), mRbsDevice(nullptr) {
     sInstance = this;  // keep track of the most recent instance
 
-    if (mDevice) {
-        ALOGI("fingerprint HAL already opened");
-    } else {
-        for (auto& [module] : kModules) {
-            std::string class_name;
-            std::string class_module_id;
+    mRbsDevice = openRbsFingerprintHal();
 
-            auto parts = ::android::base::Split(module, ":");
+    if (!mRbsDevice) {
+        if (mDevice) {
+            ALOGI("fingerprint HAL already opened");
+        } else {
+            for (auto& [module] : kModules) {
+                std::string class_name;
+                std::string class_module_id;
 
-            if (parts.size() == 2) {
-                class_name = parts[0];
-                class_module_id = parts[1];
-            } else {
-                class_name = module;
-                class_module_id = FINGERPRINT_HARDWARE_MODULE_ID;
-            }
+                auto parts = ::android::base::Split(module, ":");
 
-            mDevice = openFingerprintHal(class_name.c_str(), class_module_id.c_str());
-            if (!mDevice) {
-                ALOGE("Can't open HAL module, class: %s, module_id: %s", class_name.c_str(),
+                if (parts.size() == 2) {
+                    class_name = parts[0];
+                    class_module_id = parts[1];
+                } else {
+                    class_name = module;
+                    class_module_id = FINGERPRINT_HARDWARE_MODULE_ID;
+                }
+
+                mDevice = openFingerprintHal(class_name.c_str(), class_module_id.c_str());
+                if (!mDevice) {
+                    ALOGE("Can't open HAL module, class: %s, module_id: %s", class_name.c_str(),
+                          class_module_id.c_str());
+                    continue;
+                }
+                ALOGI("Opened fingerprint HAL, class: %s, module_id: %s", class_name.c_str(),
                       class_module_id.c_str());
-                continue;
+                break;
             }
-            ALOGI("Opened fingerprint HAL, class: %s, module_id: %s", class_name.c_str(),
-                  class_module_id.c_str());
-            break;
-        }
-        if (!mDevice) {
-            ALOGE("Can't open any fingerprint HAL module");
-            ::android::base::SetProperty("vendor.hw.fingerprint.status", "fail");
+            if (!mDevice) {
+                ALOGE("Can't open any fingerprint HAL module");
+                ::android::base::SetProperty("vendor.hw.fingerprint.status", "fail");
+            }
         }
     }
 
@@ -89,7 +95,7 @@ Fingerprint::Fingerprint(std::shared_ptr<FingerprintConfig> config) : mConfig(st
             mUdfpsHandler = mUdfpsHandlerFactory->create();
             if (!mUdfpsHandler) {
                 ALOGE("Can't create UdfpsHandler");
-            } else {
+            } else if (mDevice) {
                 mUdfpsHandler->init(mDevice);
             }
         }
@@ -112,16 +118,18 @@ Fingerprint::~Fingerprint() {
     if (mUdfpsHandler) {
         mUdfpsHandlerFactory->destroy(mUdfpsHandler);
     }
-    if (mDevice == nullptr) {
-        ALOGE("No valid device");
-        return;
+    if (mRbsDevice) {
+        mRbsDevice->rbs_uninitialize();
+        free(mRbsDevice);
+        mRbsDevice = nullptr;
     }
-    int err;
-    if (0 != (err = mDevice->common.close(reinterpret_cast<hw_device_t*>(mDevice)))) {
-        ALOGE("Can't close fingerprint module, error: %d", err);
-        return;
+    if (mDevice != nullptr) {
+        int err;
+        if (0 != (err = mDevice->common.close(reinterpret_cast<hw_device_t*>(mDevice)))) {
+            ALOGE("Can't close fingerprint module, error: %d", err);
+        }
+        mDevice = nullptr;
     }
-    mDevice = nullptr;
 }
 
 fingerprint_device_t* Fingerprint::openFingerprintHal(const char* class_name,
@@ -158,6 +166,133 @@ fingerprint_device_t* Fingerprint::openFingerprintHal(const char* class_name,
     }
 
     return fp_device;
+}
+
+rbs_fingerprint_device_t* Fingerprint::openRbsFingerprintHal() {
+    bool has_egis = (access("/dev/egis_fp", F_OK) == 0 || access("/dev/ets_fp", F_OK) == 0 ||
+                     access("/dev/egis", F_OK) == 0 || access("/dev/esfp0", F_OK) == 0);
+    if (!has_egis) return nullptr;
+
+    void* rbs_handle = dlopen("libRbsFlow.so", RTLD_NOW);
+    if (rbs_handle == nullptr) {
+        ALOGE("Failed to dlopen libRbsFlow.so: %s", dlerror());
+        return nullptr;
+    }
+
+    ALOGI("Detected Egistec RBS library");
+    auto rbsDevice = static_cast<rbs_fingerprint_device_t*>(malloc(sizeof(rbs_fingerprint_device_t)));
+    if (!rbsDevice) return nullptr;
+
+    rbsDevice->rbs_initialize = reinterpret_cast<typeof(rbsDevice->rbs_initialize)>(dlsym(rbs_handle, "rbs_initialize"));
+    rbsDevice->rbs_uninitialize = reinterpret_cast<typeof(rbsDevice->rbs_uninitialize)>(dlsym(rbs_handle, "rbs_uninitialize"));
+    rbsDevice->rbs_cancel = reinterpret_cast<typeof(rbsDevice->rbs_cancel)>(dlsym(rbs_handle, "rbs_cancel"));
+    rbsDevice->rbs_active_user_group = reinterpret_cast<typeof(rbsDevice->rbs_active_user_group)>(dlsym(rbs_handle, "rbs_active_user_group"));
+    rbsDevice->rbs_set_data_path = reinterpret_cast<typeof(rbsDevice->rbs_set_data_path)>(dlsym(rbs_handle, "rbs_set_data_path"));
+    rbsDevice->rbs_chk_secure_id = reinterpret_cast<typeof(rbsDevice->rbs_chk_secure_id)>(dlsym(rbs_handle, "rbs_chk_secure_id"));
+    rbsDevice->rbs_pre_enroll = reinterpret_cast<typeof(rbsDevice->rbs_pre_enroll)>(dlsym(rbs_handle, "rbs_pre_enroll"));
+    rbsDevice->rbs_enroll = reinterpret_cast<typeof(rbsDevice->rbs_enroll)>(dlsym(rbs_handle, "rbs_enroll"));
+    rbsDevice->rbs_post_enroll = reinterpret_cast<typeof(rbsDevice->rbs_post_enroll)>(dlsym(rbs_handle, "rbs_post_enroll"));
+    rbsDevice->rbs_chk_auth_token = reinterpret_cast<typeof(rbsDevice->rbs_chk_auth_token)>(dlsym(rbs_handle, "rbs_chk_auth_token"));
+    rbsDevice->rbs_authenticator = reinterpret_cast<typeof(rbsDevice->rbs_authenticator)>(dlsym(rbs_handle, "rbs_authenticator"));
+    rbsDevice->rbs_remove_fingerprint = reinterpret_cast<typeof(rbsDevice->rbs_remove_fingerprint)>(dlsym(rbs_handle, "rbs_remove_fingerprint"));
+    rbsDevice->rbs_get_fingerprint_ids = reinterpret_cast<typeof(rbsDevice->rbs_get_fingerprint_ids)>(dlsym(rbs_handle, "rbs_get_fingerprint_ids"));
+    rbsDevice->rbs_get_authenticator_id = reinterpret_cast<typeof(rbsDevice->rbs_get_authenticator_id)>(dlsym(rbs_handle, "rbs_get_authenticator_id"));
+    rbsDevice->rbs_set_on_callback_proc = reinterpret_cast<typeof(rbsDevice->rbs_set_on_callback_proc)>(dlsym(rbs_handle, "rbs_set_on_callback_proc"));
+    rbsDevice->rbs_extra_api = reinterpret_cast<typeof(rbsDevice->rbs_extra_api)>(dlsym(rbs_handle, "rbs_extra_api"));
+
+    if (rbsDevice->rbs_initialize && rbsDevice->rbs_uninitialize && rbsDevice->rbs_cancel &&
+        rbsDevice->rbs_active_user_group && rbsDevice->rbs_chk_secure_id && rbsDevice->rbs_pre_enroll &&
+        rbsDevice->rbs_enroll && rbsDevice->rbs_post_enroll && rbsDevice->rbs_chk_auth_token &&
+        rbsDevice->rbs_authenticator && rbsDevice->rbs_remove_fingerprint && rbsDevice->rbs_get_fingerprint_ids &&
+        rbsDevice->rbs_get_authenticator_id && rbsDevice->rbs_set_on_callback_proc) {
+
+        rbsDevice->rbs_set_on_callback_proc(reinterpret_cast<void*>(Fingerprint::rbsNotify));
+        int err = rbsDevice->rbs_initialize(0, 0);
+        if (err == 0) {
+            ALOGI("Initialized Egistec RBS fingerprint sensor successfully");
+            return rbsDevice;
+        } else {
+            ALOGE("Can't initialize RBS fingerprint, error: %d", err);
+        }
+    } else {
+        ALOGE("Failed to load all RBS symbols from libRbsFlow.so");
+    }
+
+    free(rbsDevice);
+    return nullptr;
+}
+
+void Fingerprint::rbsNotify(uint32_t eventId, uint32_t value1, uint32_t value2, void* buffer, uint32_t buffer_size) {
+    if (sInstance) {
+        sInstance->handleRbsNotify(eventId, value1, value2, buffer, buffer_size);
+    }
+}
+
+void Fingerprint::handleRbsNotify(uint32_t eventId, uint32_t value1, uint32_t value2, void* buffer, uint32_t /* buffer_size */) {
+    ALOGI("handleRbsNotify: eventId = %u, value1 = %u, value2 = %u", eventId, value1, value2);
+    fingerprint_msg_t msg;
+    memset(&msg, 0, sizeof(msg));
+
+    switch (eventId) {
+        case 0x3eb:
+        case 0x401:
+            msg.type = FINGERPRINT_ERROR;
+            msg.data.error = FINGERPRINT_ERROR_CANCELED;
+            break;
+        case 0x40e:
+            msg.type = FINGERPRINT_ERROR;
+            msg.data.error = FINGERPRINT_ERROR_TIMEOUT;
+            break;
+        case 0x3ec:
+        case 0x3ed:
+            msg.type = FINGERPRINT_ACQUIRED;
+            msg.data.acquired.acquired_info = FINGERPRINT_ACQUIRED_TOO_SLOW;
+            break;
+        case 0x3ee:
+        case 0x3ef:
+            msg.type = FINGERPRINT_ACQUIRED;
+            msg.data.acquired.acquired_info = FINGERPRINT_ACQUIRED_VENDOR_BASE;
+            break;
+        case 0x3f5:
+            msg.type = FINGERPRINT_ACQUIRED;
+            msg.data.acquired.acquired_info = FINGERPRINT_ACQUIRED_INSUFFICIENT;
+            break;
+        case 0x3f7:
+        case 0x3f8:
+            msg.type = FINGERPRINT_ACQUIRED;
+            msg.data.acquired.acquired_info = FINGERPRINT_ACQUIRED_PARTIAL;
+            break;
+        case 0x3f9:
+        case 0x3fa:
+        case 0x3fb:
+            msg.type = FINGERPRINT_ACQUIRED;
+            msg.data.acquired.acquired_info = FINGERPRINT_ACQUIRED_TOO_FAST;
+            break;
+        case 0x3fe:
+            msg.type = FINGERPRINT_ACQUIRED;
+            msg.data.acquired.acquired_info = FINGERPRINT_ACQUIRED_GOOD;
+            break;
+        case 0x40d:
+            msg.type = FINGERPRINT_TEMPLATE_ENROLLING;
+            msg.data.enroll.finger.fid = value1;
+            msg.data.enroll.finger.gid = mSession ? mSession->getUserId() : 0;
+            msg.data.enroll.samples_remaining = value2;
+            break;
+        case 0x3f2:
+        case 0x3f3:
+            msg.type = FINGERPRINT_AUTHENTICATED;
+            msg.data.authenticated.finger.gid = value1;
+            msg.data.authenticated.finger.fid = value2;
+            if (value2 != 0 && buffer != nullptr) {
+                memcpy(&msg.data.authenticated.hat, buffer, sizeof(hw_auth_token_t));
+            }
+            break;
+        default:
+            ALOGW("handleRbsNotify: unknown eventId %u", eventId);
+            return;
+    }
+
+    notify(&msg);
 }
 
 std::vector<SensorLocation> Fingerprint::getSensorLocations() {

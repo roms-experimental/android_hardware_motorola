@@ -29,9 +29,11 @@ void onClientDeath(void* cookie);
 
 class Session : public BnSession {
   public:
-    Session(fingerprint_device_t* device, UdfpsHandler* udfpsHandler, int userId,
+    Session(fingerprint_device_t* device, rbs_fingerprint_device_t* rbsDevice,
+            UdfpsHandler* udfpsHandler, int userId,
             std::shared_ptr<ISessionCallback> cb, LockoutTracker lockoutTracker,
             std::vector<SensorLocation> sensorLocations);
+    int32_t getUserId() const { return mUserId; }
     ndk::ScopedAStatus generateChallenge() override;
     ndk::ScopedAStatus revokeChallenge(int64_t challenge) override;
     ndk::ScopedAStatus enroll(const HardwareAuthToken& hat,
@@ -69,6 +71,8 @@ class Session : public BnSession {
 
   private:
     fingerprint_device_t* mDevice;
+    rbs_fingerprint_device_t* mRbsDevice;
+    uint64_t mChallenge = 0;
     LockoutTracker mLockoutTracker;
     bool mClosed = false;
 

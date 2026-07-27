@@ -32,6 +32,7 @@ int main() {
     } else {
         LOG(ERROR) << "Failed to register fingerprint service";
         android::base::SetProperty("vendor.hw.fingerprint.status", "fail");
+        return EXIT_FAILURE;
     }
 
     ABinderProcess_joinThreadPool();

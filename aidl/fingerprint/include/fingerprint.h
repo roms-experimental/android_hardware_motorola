@@ -289,3 +289,21 @@ typedef struct rbs_fingerprint_device {
     int (*rbs_set_on_callback_proc)(void* callback_proc);
     int (*rbs_extra_api)(uint32_t, const uint8_t*, uint32_t, uint8_t*, uint32_t*);
 } rbs_fingerprint_device_t;
+
+typedef struct anc_fingerprint_device {
+    fingerprint_device_t* (*GetFingerprintDevice)();
+    int (*InitFingerprintDevice)(fingerprint_device_t* dev);
+    int (*DeinitFingerprintDevice)(fingerprint_device_t* dev);
+    int (*AncSetNotifyCallback)(fingerprint_device_t* dev, void* notify_cb);
+    int (*AncSetActiveGroup)(fingerprint_device_t* dev, uint32_t gid, const char* store_path);
+    uint64_t (*AncGenerateChallenge)(fingerprint_device_t* dev);
+    int (*AncRevokeChallenge)(fingerprint_device_t* dev, uint64_t challenge);
+    int (*AncEnroll)(fingerprint_device_t* dev, const hw_auth_token_t* hat, uint32_t gid, uint32_t timeout_sec);
+    int (*AncAuthenticate)(fingerprint_device_t* dev, uint64_t operation_id, uint32_t gid);
+    int (*AncEnumerate)(fingerprint_device_t* dev);
+    int (*AncRemove)(fingerprint_device_t* dev, uint32_t gid, uint32_t fid);
+    uint64_t (*AncGetAuthenticatorId)(fingerprint_device_t* dev);
+    uint64_t (*AncInvalidateAuthenticatorId)(fingerprint_device_t* dev);
+    int (*AncResetLockout)(fingerprint_device_t* dev, const hw_auth_token_t* hat);
+    int (*AncCancel)(fingerprint_device_t* dev);
+} anc_fingerprint_device_t;

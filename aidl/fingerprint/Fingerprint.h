@@ -34,6 +34,7 @@ class Fingerprint : public BnFingerprint {
   private:
     fingerprint_device_t* openFingerprintHal(const char* class_name, const char* module_id);
     rbs_fingerprint_device_t* openRbsFingerprintHal();
+    anc_fingerprint_device_t* openAncFingerprintHal(fingerprint_device_t** outDev);
     std::vector<SensorLocation> getSensorLocations();
     static void notify(const fingerprint_msg_t* msg);
     static void rbsNotify(uint32_t eventId, uint32_t value1, uint32_t value2, void* buffer, uint32_t buffer_size);
@@ -46,6 +47,7 @@ class Fingerprint : public BnFingerprint {
 
     fingerprint_device_t* mDevice;
     rbs_fingerprint_device_t* mRbsDevice;
+    anc_fingerprint_device_t* mAncDevice;
     UdfpsHandlerFactory* mUdfpsHandlerFactory;
     UdfpsHandler* mUdfpsHandler;
 };

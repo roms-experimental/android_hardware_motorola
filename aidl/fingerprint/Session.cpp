@@ -22,11 +22,12 @@ void onClientDeath(void* cookie) {
 }
 
 Session::Session(fingerprint_device_t* device, rbs_fingerprint_device_t* rbsDevice,
-                 UdfpsHandler* udfpsHandler, int userId,
+                 anc_fingerprint_device_t* ancDevice, UdfpsHandler* udfpsHandler, int userId,
                  std::shared_ptr<ISessionCallback> cb, LockoutTracker lockoutTracker,
                  std::vector<SensorLocation> sensorLocations)
     : mDevice(device),
       mRbsDevice(rbsDevice),
+      mAncDevice(ancDevice),
       mLockoutTracker(lockoutTracker),
       mUserId(userId),
       mCb(cb),
@@ -35,7 +36,13 @@ Session::Session(fingerprint_device_t* device, rbs_fingerprint_device_t* rbsDevi
     mDeathRecipient = AIBinder_DeathRecipient_new(onClientDeath);
 
     auto path = std::format("/data/vendor_de/{}/fpdata/", userId);
-    if (mRbsDevice) {
+    if (mAncDevice && mAncDevice->AncSetActiveGroup) {
+        ALOGI("setActiveGroup (ANC)");
+        int rc = mAncDevice->AncSetActiveGroup(mDevice, userId, path.c_str());
+        if (rc != 0) {
+            ALOGE("AncSetActiveGroup failed, error: %d", rc);
+        }
+    } else if (mRbsDevice) {
         ALOGI("setActiveGroup (RBS)");
         int rc = mRbsDevice->rbs_active_user_group(userId, path.c_str());
         if (rc != 0) {
@@ -51,6 +58,11 @@ Session::Session(fingerprint_device_t* device, rbs_fingerprint_device_t* rbsDevi
 }
 
 ndk::ScopedAStatus Session::generateChallenge() {
+    if (mAncDevice && mAncDevice->AncGenerateChallenge) {
+        uint64_t challenge = mAncDevice->AncGenerateChallenge(mDevice);
+        mCb->onChallengeGenerated(challenge);
+        return ndk::ScopedAStatus::ok();
+    }
     if (mRbsDevice) {
         mChallenge = static_cast<uint64_t>(rand()) | (static_cast<uint64_t>(rand()) << 32);
         int rc = mRbsDevice->rbs_pre_enroll(mUserId, 10);
@@ -68,6 +80,14 @@ ndk::ScopedAStatus Session::generateChallenge() {
 }
 
 ndk::ScopedAStatus Session::revokeChallenge(int64_t challenge) {
+    if (mAncDevice && mAncDevice->AncRevokeChallenge) {
+        int error = mAncDevice->AncRevokeChallenge(mDevice, challenge);
+        if (error) {
+            ALOGE("Failed to revoke challenge (ANC)=%" PRId64 " error=%d", challenge, error);
+        }
+        mCb->onChallengeRevoked(challenge);
+        return ndk::ScopedAStatus::ok();
+    }
     if (mRbsDevice) {
         mChallenge = 0;
         int rc = mRbsDevice->rbs_post_enroll();
@@ -86,6 +106,18 @@ ndk::ScopedAStatus Session::revokeChallenge(int64_t challenge) {
 
 ndk::ScopedAStatus Session::enroll(const HardwareAuthToken& hat,
                                    std::shared_ptr<ICancellationSignal>* out) {
+    if (mAncDevice && mAncDevice->AncEnroll) {
+        hw_auth_token_t authToken;
+        translate(hat, authToken);
+        int error = mAncDevice->AncEnroll(mDevice, &authToken, mUserId, 60);
+        if (error) {
+            ALOGE("AncEnroll failed: %d", error);
+            mCb->onError(Error::UNABLE_TO_PROCESS, error);
+        }
+        *out = SharedRefBase::make<CancellationSignal>(this);
+        return ndk::ScopedAStatus::ok();
+    }
+
     if (mRbsDevice) {
         hw_auth_token_t authToken;
         translate(hat, authToken);
@@ -167,6 +199,16 @@ ndk::ScopedAStatus Session::enroll(const HardwareAuthToken& hat,
 
 ndk::ScopedAStatus Session::authenticate(int64_t operationId,
                                          std::shared_ptr<ICancellationSignal>* out) {
+    if (mAncDevice && mAncDevice->AncAuthenticate) {
+        checkSensorLockout();
+        int error = mAncDevice->AncAuthenticate(mDevice, operationId, mUserId);
+        if (error) {
+            ALOGE("AncAuthenticate failed: %d", error);
+        }
+        *out = SharedRefBase::make<CancellationSignal>(this);
+        return ndk::ScopedAStatus::ok();
+    }
+
     if (mRbsDevice) {
         checkSensorLockout();
         mRbsDevice->rbs_cancel(nullptr, 2);
@@ -204,6 +246,14 @@ ndk::ScopedAStatus Session::detectInteraction(std::shared_ptr<ICancellationSigna
 }
 
 ndk::ScopedAStatus Session::enumerateEnrollments() {
+    if (mAncDevice && mAncDevice->AncEnumerate) {
+        int error = mAncDevice->AncEnumerate(mDevice);
+        if (error) {
+            ALOGE("AncEnumerate failed: %d", error);
+        }
+        return ndk::ScopedAStatus::ok();
+    }
+
     if (mRbsDevice) {
         uint32_t num_fids = 0;
         uint32_t fids[5] = {};
@@ -231,6 +281,17 @@ ndk::ScopedAStatus Session::enumerateEnrollments() {
 
 ndk::ScopedAStatus Session::removeEnrollments(const std::vector<int32_t>& enrollmentIds) {
     ALOGI("removeEnrollments, size: %zu", enrollmentIds.size());
+
+    if (mAncDevice && mAncDevice->AncRemove) {
+        if (enrollmentIds.empty()) {
+            mAncDevice->AncRemove(mDevice, mUserId, 0);
+        } else {
+            for (int32_t fid : enrollmentIds) {
+                mAncDevice->AncRemove(mDevice, mUserId, fid);
+            }
+        }
+        return ndk::ScopedAStatus::ok();
+    }
 
     if (mRbsDevice) {
         if (enrollmentIds.empty()) {
@@ -284,6 +345,12 @@ ndk::ScopedAStatus Session::removeEnrollments(const std::vector<int32_t>& enroll
 }
 
 ndk::ScopedAStatus Session::getAuthenticatorId() {
+    if (mAncDevice && mAncDevice->AncGetAuthenticatorId) {
+        uint64_t auth_id = mAncDevice->AncGetAuthenticatorId(mDevice);
+        mCb->onAuthenticatorIdRetrieved(auth_id);
+        return ndk::ScopedAStatus::ok();
+    }
+
     if (mRbsDevice) {
         uint64_t auth_id = 0;
         int rc = mRbsDevice->rbs_get_authenticator_id(&auth_id);
@@ -301,6 +368,12 @@ ndk::ScopedAStatus Session::getAuthenticatorId() {
 }
 
 ndk::ScopedAStatus Session::invalidateAuthenticatorId() {
+    if (mAncDevice && mAncDevice->AncInvalidateAuthenticatorId) {
+        uint64_t new_auth_id = mAncDevice->AncInvalidateAuthenticatorId(mDevice);
+        mCb->onAuthenticatorIdInvalidated(new_auth_id);
+        return ndk::ScopedAStatus::ok();
+    }
+
     if (mRbsDevice) {
         uint64_t new_auth_id = 0;
         int rc = mRbsDevice->rbs_get_authenticator_id(&new_auth_id);
@@ -317,7 +390,15 @@ ndk::ScopedAStatus Session::invalidateAuthenticatorId() {
     return ndk::ScopedAStatus::ok();
 }
 
-ndk::ScopedAStatus Session::resetLockout(const HardwareAuthToken& /*hat*/) {
+ndk::ScopedAStatus Session::resetLockout(const HardwareAuthToken& hat) {
+    if (mAncDevice && mAncDevice->AncResetLockout) {
+        hw_auth_token_t authToken;
+        translate(hat, authToken);
+        int error = mAncDevice->AncResetLockout(mDevice, &authToken);
+        if (error) {
+            ALOGE("AncResetLockout failed: %d", error);
+        }
+    }
     clearLockout(true);
     if (mIsLockoutTimerStarted) mIsLockoutTimerAborted = true;
 
@@ -402,6 +483,15 @@ ndk::ScopedAStatus Session::setIgnoreDisplayTouches(bool /*shouldIgnore*/) {
 ndk::ScopedAStatus Session::cancel() {
     if (mUdfpsHandler) {
         mUdfpsHandler->cancel();
+    }
+
+    if (mAncDevice && mAncDevice->AncCancel) {
+        int ret = mAncDevice->AncCancel(mDevice);
+        if (ret == 0) {
+            mCb->onError(Error::CANCELED, 0);
+            return ndk::ScopedAStatus::ok();
+        }
+        return ndk::ScopedAStatus::fromServiceSpecificError(ret);
     }
 
     if (mRbsDevice) {

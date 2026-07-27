@@ -30,7 +30,7 @@ void onClientDeath(void* cookie);
 class Session : public BnSession {
   public:
     Session(fingerprint_device_t* device, rbs_fingerprint_device_t* rbsDevice,
-            UdfpsHandler* udfpsHandler, int userId,
+            anc_fingerprint_device_t* ancDevice, UdfpsHandler* udfpsHandler, int userId,
             std::shared_ptr<ISessionCallback> cb, LockoutTracker lockoutTracker,
             std::vector<SensorLocation> sensorLocations);
     int32_t getUserId() const { return mUserId; }
@@ -72,6 +72,7 @@ class Session : public BnSession {
   private:
     fingerprint_device_t* mDevice;
     rbs_fingerprint_device_t* mRbsDevice;
+    anc_fingerprint_device_t* mAncDevice;
     uint64_t mChallenge = 0;
     LockoutTracker mLockoutTracker;
     bool mClosed = false;

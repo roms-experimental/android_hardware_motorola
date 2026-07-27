@@ -41,12 +41,15 @@ static const uint16_t kVersion = HARDWARE_MODULE_API_VERSION(2, 1);
 static Fingerprint* sInstance;
 
 Fingerprint::Fingerprint(std::shared_ptr<FingerprintConfig> config)
-    : mConfig(std::move(config)), mDevice(nullptr), mRbsDevice(nullptr) {
+    : mConfig(std::move(config)), mDevice(nullptr), mRbsDevice(nullptr), mAncDevice(nullptr) {
     sInstance = this;  // keep track of the most recent instance
 
     mRbsDevice = openRbsFingerprintHal();
-
     if (!mRbsDevice) {
+        mAncDevice = openAncFingerprintHal(&mDevice);
+    }
+
+    if (!mRbsDevice && !mAncDevice) {
         if (mDevice) {
             ALOGI("fingerprint HAL already opened");
         } else {
@@ -122,6 +125,13 @@ Fingerprint::~Fingerprint() {
         mRbsDevice->rbs_uninitialize();
         free(mRbsDevice);
         mRbsDevice = nullptr;
+    }
+    if (mAncDevice) {
+        if (mAncDevice->DeinitFingerprintDevice && mDevice) {
+            mAncDevice->DeinitFingerprintDevice(mDevice);
+        }
+        free(mAncDevice);
+        mAncDevice = nullptr;
     }
     if (mDevice != nullptr) {
         int err;
@@ -295,6 +305,55 @@ void Fingerprint::handleRbsNotify(uint32_t eventId, uint32_t value1, uint32_t va
     notify(&msg);
 }
 
+anc_fingerprint_device_t* Fingerprint::openAncFingerprintHal(fingerprint_device_t** outDev) {
+    void* anc_handle = dlopen("anc.hal.so", RTLD_NOW);
+    if (anc_handle == nullptr) {
+        return nullptr;
+    }
+
+    ALOGI("Detected Jiiov ANC library (anc.hal.so)");
+    auto ancDevice = static_cast<anc_fingerprint_device_t*>(malloc(sizeof(anc_fingerprint_device_t)));
+    if (ancDevice) {
+        memset(ancDevice, 0, sizeof(anc_fingerprint_device_t));
+        ancDevice->GetFingerprintDevice = reinterpret_cast<typeof(ancDevice->GetFingerprintDevice)>(dlsym(anc_handle, "GetFingerprintDevice"));
+        ancDevice->InitFingerprintDevice = reinterpret_cast<typeof(ancDevice->InitFingerprintDevice)>(dlsym(anc_handle, "InitFingerprintDevice"));
+        ancDevice->DeinitFingerprintDevice = reinterpret_cast<typeof(ancDevice->DeinitFingerprintDevice)>(dlsym(anc_handle, "DeinitFingerprintDevice"));
+        ancDevice->AncSetNotifyCallback = reinterpret_cast<typeof(ancDevice->AncSetNotifyCallback)>(dlsym(anc_handle, "AncSetNotifyCallback"));
+        ancDevice->AncSetActiveGroup = reinterpret_cast<typeof(ancDevice->AncSetActiveGroup)>(dlsym(anc_handle, "AncSetActiveGroup"));
+        ancDevice->AncGenerateChallenge = reinterpret_cast<typeof(ancDevice->AncGenerateChallenge)>(dlsym(anc_handle, "AncGenerateChallenge"));
+        ancDevice->AncRevokeChallenge = reinterpret_cast<typeof(ancDevice->AncRevokeChallenge)>(dlsym(anc_handle, "AncRevokeChallenge"));
+        ancDevice->AncEnroll = reinterpret_cast<typeof(ancDevice->AncEnroll)>(dlsym(anc_handle, "AncEnroll"));
+        ancDevice->AncAuthenticate = reinterpret_cast<typeof(ancDevice->AncAuthenticate)>(dlsym(anc_handle, "AncAuthenticate"));
+        ancDevice->AncEnumerate = reinterpret_cast<typeof(ancDevice->AncEnumerate)>(dlsym(anc_handle, "AncEnumerate"));
+        ancDevice->AncRemove = reinterpret_cast<typeof(ancDevice->AncRemove)>(dlsym(anc_handle, "AncRemove"));
+        ancDevice->AncGetAuthenticatorId = reinterpret_cast<typeof(ancDevice->AncGetAuthenticatorId)>(dlsym(anc_handle, "AncGetAuthenticatorId"));
+        ancDevice->AncInvalidateAuthenticatorId = reinterpret_cast<typeof(ancDevice->AncInvalidateAuthenticatorId)>(dlsym(anc_handle, "AncInvalidateAuthenticatorId"));
+        ancDevice->AncResetLockout = reinterpret_cast<typeof(ancDevice->AncResetLockout)>(dlsym(anc_handle, "AncResetLockout"));
+        ancDevice->AncCancel = reinterpret_cast<typeof(ancDevice->AncCancel)>(dlsym(anc_handle, "AncCancel"));
+
+        if (ancDevice->GetFingerprintDevice && ancDevice->InitFingerprintDevice && ancDevice->AncSetNotifyCallback) {
+            fingerprint_device_t* dev = ancDevice->GetFingerprintDevice();
+            if (!dev) {
+                dev = static_cast<fingerprint_device_t*>(malloc(sizeof(fingerprint_device_t)));
+                memset(dev, 0, sizeof(fingerprint_device_t));
+            }
+            ancDevice->AncSetNotifyCallback(dev, reinterpret_cast<void*>(Fingerprint::notify));
+            int err = ancDevice->InitFingerprintDevice(dev);
+            if (err == 0) {
+                ALOGI("Initialized Jiiov ANC fingerprint sensor successfully");
+                if (outDev) *outDev = dev;
+                return ancDevice;
+            } else {
+                ALOGE("Failed to initialize ANC fingerprint device: %d", err);
+            }
+        } else {
+            ALOGE("Failed to load ANC symbols from anc.hal.so");
+        }
+        free(ancDevice);
+    }
+    return nullptr;
+}
+
 std::vector<SensorLocation> Fingerprint::getSensorLocations() {
     std::vector<SensorLocation> locations;
 
@@ -373,7 +432,7 @@ ndk::ScopedAStatus Fingerprint::createSession(int32_t /*sensorId*/, int32_t user
                                               std::shared_ptr<ISession>* out) {
     CHECK(mSession == nullptr || mSession->isClosed()) << "Open session already exists!";
 
-    mSession = SharedRefBase::make<Session>(mDevice, mUdfpsHandler, userId, cb, mLockoutTracker, getSensorLocations());
+    mSession = SharedRefBase::make<Session>(mDevice, mRbsDevice, mAncDevice, mUdfpsHandler, userId, cb, mLockoutTracker, getSensorLocations());
     *out = mSession;
 
     mSession->linkToDeath(cb->asBinder().get());

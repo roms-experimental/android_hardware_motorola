@@ -22,12 +22,14 @@ void onClientDeath(void* cookie) {
 }
 
 Session::Session(fingerprint_device_t* device, UdfpsHandler* udfpsHandler, int userId,
-                 std::shared_ptr<ISessionCallback> cb, LockoutTracker lockoutTracker)
+                 std::shared_ptr<ISessionCallback> cb, LockoutTracker lockoutTracker,
+                 std::vector<SensorLocation> sensorLocations)
     : mDevice(device),
       mLockoutTracker(lockoutTracker),
       mUserId(userId),
       mCb(cb),
-      mUdfpsHandler(udfpsHandler) {
+      mUdfpsHandler(udfpsHandler),
+      mSensorLocations(std::move(sensorLocations)) {
     mDeathRecipient = AIBinder_DeathRecipient_new(onClientDeath);
 
     auto path = std::format("/data/vendor_de/{}/fpdata/", userId);
@@ -97,10 +99,17 @@ ndk::ScopedAStatus Session::enumerateEnrollments() {
 ndk::ScopedAStatus Session::removeEnrollments(const std::vector<int32_t>& enrollmentIds) {
     ALOGI("removeEnrollments, size: %zu", enrollmentIds.size());
 
-    for (int32_t fid : enrollmentIds) {
-        int error = mDevice->remove(mDevice, mUserId, fid);
+    if (enrollmentIds.empty()) {
+        int error = mDevice->remove(mDevice, mUserId, 0);
         if (error) {
             ALOGE("remove failed: %d", error);
+        }
+    } else {
+        for (int32_t fid : enrollmentIds) {
+            int error = mDevice->remove(mDevice, mUserId, fid);
+            if (error) {
+                ALOGE("remove failed: %d", error);
+            }
         }
     }
     return ndk::ScopedAStatus::ok();
@@ -144,7 +153,16 @@ ndk::ScopedAStatus Session::onPointerUp(int32_t /*pointerId*/) {
 }
 
 ndk::ScopedAStatus Session::onUiReady() {
-    // TODO: stub
+    if (mUdfpsHandler) {
+        if (!mSensorLocations.empty()) {
+            mUdfpsHandler->onFingerDown(mSensorLocations[0].sensorLocationX,
+                                        mSensorLocations[0].sensorLocationY,
+                                        mSensorLocations[0].sensorRadius,
+                                        mSensorLocations[0].sensorRadius);
+        } else {
+            mUdfpsHandler->onFingerDown(0, 0, 0, 0);
+        }
+    }
 
     return ndk::ScopedAStatus::ok();
 }
@@ -224,8 +242,13 @@ Error Session::VendorErrorFilter(int32_t error, int32_t* vendorCode) {
 
     switch (error) {
         case FINGERPRINT_ERROR_HW_UNAVAILABLE:
+        case FINGERPRINT_ERROR_VENDOR_BASE + 1:
+        case FINGERPRINT_ERROR_VENDOR_BASE + 2:
+        case FINGERPRINT_ERROR_VENDOR_BASE + 3:
             return Error::HW_UNAVAILABLE;
         case FINGERPRINT_ERROR_UNABLE_TO_PROCESS:
+        case FINGERPRINT_ERROR_VENDOR_BASE + 4:
+        case FINGERPRINT_ERROR_VENDOR_BASE + 5:
             return Error::UNABLE_TO_PROCESS;
         case FINGERPRINT_ERROR_TIMEOUT:
             return Error::TIMEOUT;
@@ -267,7 +290,13 @@ AcquiredInfo Session::VendorAcquiredFilter(int32_t info, int32_t* vendorCode) {
         case FINGERPRINT_ACQUIRED_TOO_SLOW:
             return AcquiredInfo::TOO_SLOW;
         case FINGERPRINT_ACQUIRED_TOO_FAST:
+        case FINGERPRINT_ACQUIRED_VENDOR_BASE + 8:
             return AcquiredInfo::TOO_FAST;
+        case FINGERPRINT_ACQUIRED_VENDOR_BASE + 5:
+        case FINGERPRINT_ACQUIRED_VENDOR_BASE + 6:
+        case FINGERPRINT_ACQUIRED_VENDOR_BASE + 7:
+            *vendorCode = info - FINGERPRINT_ACQUIRED_VENDOR_BASE;
+            return AcquiredInfo::VENDOR;
         default:
             if (info >= FINGERPRINT_ACQUIRED_VENDOR_BASE) {
                 // vendor specific code.
@@ -336,10 +365,12 @@ void Session::notify(const fingerprint_msg_t* msg) {
             if (mUdfpsHandler) {
                 mUdfpsHandler->onAcquired(static_cast<int32_t>(result), vendorCode);
             }
-            // don't process vendor messages further since frameworks try to disable
-            // udfps display mode on vendor acquired messages but our sensors send a
-            // vendor message during processing...
-            if (result != AcquiredInfo::VENDOR) {
+            // Filter specific vendor codes that cause framework to incorrectly disable
+            // UDFPS display mode during processing. Pass through other vendor messages
+            // that may contain useful user feedback.
+            if (result == AcquiredInfo::VENDOR && (vendorCode >= 5 && vendorCode <= 7)) {
+                ALOGD("Filtering vendor acquired code %d", vendorCode);
+            } else {
                 mCb->onAcquired(result, vendorCode);
             }
         } break;
@@ -350,12 +381,6 @@ void Session::notify(const fingerprint_msg_t* msg) {
                                       msg->data.enroll.samples_remaining);
         } break;
         case FINGERPRINT_TEMPLATE_REMOVED: {
-            ALOGD("onRemove(fid=%d, gid=%d, rem=%d)", msg->data.removed.finger.fid,
-                  msg->data.removed.finger.gid, msg->data.removed.remaining_templates);
-            std::vector<int> enrollments;
-            enrollments.push_back(msg->data.removed.finger.fid);
-            mCb->onEnrollmentsRemoved(enrollments);
-#else
             std::vector<int32_t> enrollments;
             enrollments.reserve(NUM_FINGERS);
             for (unsigned int i = 0; i < NUM_FINGERS; i++) {
@@ -365,7 +390,6 @@ void Session::notify(const fingerprint_msg_t* msg) {
                 enrollments.push_back(fid);
             }
             mCb->onEnrollmentsRemoved(enrollments);
-#endif
         } break;
         case FINGERPRINT_AUTHENTICATED: {
             ALOGD("onAuthenticated(fid=%d, gid=%d)", msg->data.authenticated.finger.fid,
@@ -390,15 +414,6 @@ void Session::notify(const fingerprint_msg_t* msg) {
             }
         } break;
         case FINGERPRINT_TEMPLATE_ENUMERATING: {
-            ALOGD("onEnumerate(fid=%d, gid=%d, rem=%d)", msg->data.enumerated.finger.fid,
-                  msg->data.enumerated.finger.gid, msg->data.enumerated.remaining_templates);
-            static std::vector<int> enrollments;
-            enrollments.push_back(msg->data.enumerated.finger.fid);
-            if (msg->data.enumerated.remaining_templates == 0) {
-                mCb->onEnrollmentsEnumerated(enrollments);
-                enrollments.clear();
-            }
-#else
             std::vector<int32_t> enrollments;
             enrollments.reserve(NUM_FINGERS);
             for (unsigned int i = 0; i < NUM_FINGERS; i++) {
@@ -408,7 +423,29 @@ void Session::notify(const fingerprint_msg_t* msg) {
                 enrollments.push_back(fid);
             }
             mCb->onEnrollmentsEnumerated(enrollments);
-#endif
+        } break;
+        case FINGERPRINT_GENERATE_CHALLENGE: {
+            int64_t challenge = msg->data.data;
+            ALOGI("onChallengeGenerated: %ld", challenge);
+            mCb->onChallengeGenerated(challenge);
+        } break;
+        case FINGERPRINT_REVOKE_CHALLENGE: {
+            int64_t challenge = msg->data.data;
+            ALOGI("onChallengeRevoked: %ld", challenge);
+            mCb->onChallengeRevoked(challenge);
+        } break;
+        case FINGERPRINT_GET_AUTHENTICATOR_ID: {
+            int auth_id = msg->data.data;
+            ALOGI("onAuthenticatorIDRetrieved: %d", auth_id);
+            if (mUdfpsHandler) {
+                mUdfpsHandler->onFingerUp();
+            }
+            mCb->onAuthenticatorIdRetrieved(auth_id);
+        } break;
+        case FINGERPRINT_INVALIDATE_AUTHENTICATOR_ID: {
+            int64_t new_auth_id = msg->data.data;
+            ALOGI("onAuthenticatorIDInvalidated, new auth id: %ld", new_auth_id);
+            mCb->onAuthenticatorIdInvalidated(new_auth_id);
         } break;
     }
 }

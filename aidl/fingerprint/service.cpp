@@ -8,6 +8,7 @@
 #include "FingerprintConfig.h"
 
 #include <android-base/logging.h>
+#include <android-base/properties.h>
 #include <android/binder_manager.h>
 #include <android/binder_process.h>
 
@@ -25,7 +26,13 @@ int main() {
     const std::string instance = std::string() + Fingerprint::descriptor + "/default";
     binder_status_t status =
             AServiceManager_addService(fingerprint->asBinder().get(), instance.c_str());
-    CHECK(status == STATUS_OK);
+    if (status == STATUS_OK) {
+        LOG(INFO) << "started IFingerprint/default";
+        android::base::SetProperty("vendor.hw.fingerprint.status", "ok");
+    } else {
+        LOG(ERROR) << "Failed to register fingerprint service";
+        android::base::SetProperty("vendor.hw.fingerprint.status", "fail");
+    }
 
     ABinderProcess_joinThreadPool();
     return EXIT_FAILURE;  // should not reach

@@ -36,7 +36,7 @@ cc_binary {
     ],
     static_libs: [
         "libandroid.hardware.biometrics.fingerprint.Props",
-        "libudfpshandlerfactory.motorola",
+        "libudfpshandlerfactory",
     ],
     vendor: true,
     header_libs: ["motorolafingerprint_headers"],

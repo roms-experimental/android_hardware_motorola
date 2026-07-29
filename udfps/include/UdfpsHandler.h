@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2026 The LineageOS Project
+ * Copyright (C) 2022,2025 The LineageOS Project
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -7,16 +7,20 @@
 #pragma once
 
 #include <stdint.h>
+#include "fingerprint.h"
 
 class UdfpsHandler {
   public:
     virtual ~UdfpsHandler() = default;
 
-    virtual void onFingerDown(uint32_t x, uint32_t y, float minor, float major) = 0;
-    virtual void onFingerUp() = 0;
-    virtual void cancel() = 0;
+    virtual void init(fingerprint_device_t* device) {};
+    virtual void onFingerDown(uint32_t x, uint32_t y, float minor, float major) {};
+    virtual void onFingerUp() {};
+
+    virtual void onAcquired(int32_t result, int32_t vendorCode) {};
     virtual void onAuthenticationSucceeded() {};
     virtual void onAuthenticationFailed() {};
+    virtual void cancel() {};
 };
 
 struct UdfpsHandlerFactory {

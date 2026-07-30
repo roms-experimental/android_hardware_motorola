@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <cinttypes>
 #include <thread>
 
 #include "Legacy2Aidl.h"
@@ -23,16 +24,14 @@ void onClientDeath(void* cookie) {
 
 Session::Session(fingerprint_device_t* device, rbs_fingerprint_device_t* rbsDevice,
                  anc_fingerprint_device_t* ancDevice, UdfpsHandler* udfpsHandler, int userId,
-                 std::shared_ptr<ISessionCallback> cb, LockoutTracker lockoutTracker,
-                 std::vector<SensorLocation> sensorLocations)
+                 std::shared_ptr<ISessionCallback> cb, LockoutTracker lockoutTracker)
     : mDevice(device),
       mRbsDevice(rbsDevice),
       mAncDevice(ancDevice),
       mLockoutTracker(lockoutTracker),
       mUserId(userId),
       mCb(cb),
-      mUdfpsHandler(udfpsHandler),
-      mSensorLocations(std::move(sensorLocations)) {
+      mUdfpsHandler(udfpsHandler) {
     mDeathRecipient = AIBinder_DeathRecipient_new(onClientDeath);
 
     auto path = std::format("/data/vendor_de/{}/fpdata/", userId);
@@ -328,17 +327,10 @@ ndk::ScopedAStatus Session::removeEnrollments(const std::vector<int32_t>& enroll
         return ndk::ScopedAStatus::ok();
     }
 
-    if (enrollmentIds.empty()) {
-        int error = mDevice->remove(mDevice, mUserId, 0);
+    for (int32_t fid : enrollmentIds) {
+        int error = mDevice->remove(mDevice, mUserId, fid);
         if (error) {
             ALOGE("remove failed: %d", error);
-        }
-    } else {
-        for (int32_t fid : enrollmentIds) {
-            int error = mDevice->remove(mDevice, mUserId, fid);
-            if (error) {
-                ALOGE("remove failed: %d", error);
-            }
         }
     }
     return ndk::ScopedAStatus::ok();
@@ -428,16 +420,7 @@ ndk::ScopedAStatus Session::onPointerUp(int32_t /*pointerId*/) {
 }
 
 ndk::ScopedAStatus Session::onUiReady() {
-    if (mUdfpsHandler) {
-        if (!mSensorLocations.empty()) {
-            mUdfpsHandler->onFingerDown(mSensorLocations[0].sensorLocationX,
-                                        mSensorLocations[0].sensorLocationY,
-                                        mSensorLocations[0].sensorRadius,
-                                        mSensorLocations[0].sensorRadius);
-        } else {
-            mUdfpsHandler->onFingerDown(0, 0, 0, 0);
-        }
-    }
+    // TODO: stub
 
     return ndk::ScopedAStatus::ok();
 }
@@ -684,14 +667,10 @@ void Session::notify(const fingerprint_msg_t* msg) {
             }
         } break;
         case FINGERPRINT_TEMPLATE_REMOVED: {
-            std::vector<int32_t> enrollments;
-            enrollments.reserve(NUM_FINGERS);
-            for (unsigned int i = 0; i < NUM_FINGERS; i++) {
-                int32_t fid = msg->data.removed.fingers[i].fid;
-                if (!fid) break;
-                ALOGD("onRemove(fid=%d)", fid);
-                enrollments.push_back(fid);
-            }
+            ALOGD("onRemove(fid=%d, gid=%d, rem=%d)", msg->data.removed.finger.fid,
+                  msg->data.removed.finger.gid, msg->data.removed.remaining_templates);
+            std::vector<int> enrollments;
+            enrollments.push_back(msg->data.removed.finger.fid);
             mCb->onEnrollmentsRemoved(enrollments);
         } break;
         case FINGERPRINT_AUTHENTICATED: {
@@ -717,15 +696,14 @@ void Session::notify(const fingerprint_msg_t* msg) {
             }
         } break;
         case FINGERPRINT_TEMPLATE_ENUMERATING: {
-            std::vector<int32_t> enrollments;
-            enrollments.reserve(NUM_FINGERS);
-            for (unsigned int i = 0; i < NUM_FINGERS; i++) {
-                int32_t fid = msg->data.enumerated.fingers[i].fid;
-                if (!fid) break;
-                ALOGD("onEnumerate(fid=%d)", fid);
-                enrollments.push_back(fid);
+            ALOGD("onEnumerate(fid=%d, gid=%d, rem=%d)", msg->data.enumerated.finger.fid,
+                  msg->data.enumerated.finger.gid, msg->data.enumerated.remaining_templates);
+            static std::vector<int> enrollments;
+            enrollments.push_back(msg->data.enumerated.finger.fid);
+            if (msg->data.enumerated.remaining_templates == 0) {
+                mCb->onEnrollmentsEnumerated(enrollments);
+                enrollments.clear();
             }
-            mCb->onEnrollmentsEnumerated(enrollments);
         } break;
         case FINGERPRINT_GENERATE_CHALLENGE: {
             int64_t challenge = msg->data.data;

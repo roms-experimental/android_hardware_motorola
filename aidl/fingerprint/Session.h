@@ -20,7 +20,6 @@
 using ::aidl::android::hardware::biometrics::common::ICancellationSignal;
 using ::aidl::android::hardware::biometrics::common::OperationContext;
 using ::aidl::android::hardware::biometrics::fingerprint::PointerContext;
-using ::aidl::android::hardware::biometrics::fingerprint::SensorLocation;
 using ::aidl::android::hardware::keymaster::HardwareAuthToken;
 
 namespace aidl::android::hardware::biometrics::fingerprint {
@@ -31,8 +30,7 @@ class Session : public BnSession {
   public:
     Session(fingerprint_device_t* device, rbs_fingerprint_device_t* rbsDevice,
             anc_fingerprint_device_t* ancDevice, UdfpsHandler* udfpsHandler, int userId,
-            std::shared_ptr<ISessionCallback> cb, LockoutTracker lockoutTracker,
-            std::vector<SensorLocation> sensorLocations);
+            std::shared_ptr<ISessionCallback> cb, LockoutTracker lockoutTracker);
     int32_t getUserId() const { return mUserId; }
     ndk::ScopedAStatus generateChallenge() override;
     ndk::ScopedAStatus revokeChallenge(int64_t challenge) override;
@@ -102,7 +100,6 @@ class Session : public BnSession {
     AIBinder_DeathRecipient* mDeathRecipient;
 
     UdfpsHandler* mUdfpsHandler;
-    std::vector<SensorLocation> mSensorLocations;
 };
 
 }  // namespace aidl::android::hardware::biometrics::fingerprint

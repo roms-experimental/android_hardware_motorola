@@ -553,11 +553,16 @@ Error Session::VendorErrorFilter(int32_t error, int32_t* vendorCode) {
             return Error::CANCELED;
         case FINGERPRINT_ERROR_UNABLE_TO_REMOVE:
             return Error::UNABLE_TO_REMOVE;
-        case FINGERPRINT_ERROR_LOCKOUT: {
+        case FINGERPRINT_ERROR_LOCKOUT:
+        case 0x3f0: {
             *vendorCode = FINGERPRINT_ERROR_LOCKOUT;
             return Error::VENDOR;
         }
         default:
+            if (error > 999) {
+                *vendorCode = error - 1000;
+                return Error::VENDOR;
+            }
             if (error >= FINGERPRINT_ERROR_VENDOR_BASE) {
                 // vendor specific code.
                 *vendorCode = error - FINGERPRINT_ERROR_VENDOR_BASE;

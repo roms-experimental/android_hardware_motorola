@@ -238,6 +238,11 @@ typedef struct fingerprint_device {
      */
     int (*remove)(struct fingerprint_device *dev, uint32_t gid, uint32_t fid);
 
+#ifdef IMPL_V2
+    int (*aidl_remove)(struct fingerprint_device *dev, uint32_t gid,
+                       const int32_t *fids, size_t size);
+#endif
+
     /*
      * Restricts the HAL operation to a set of fingerprints belonging to a
      * group provided.
@@ -258,8 +263,16 @@ typedef struct fingerprint_device {
      */
     int (*authenticate)(struct fingerprint_device *dev, uint64_t operation_id, uint32_t gid);
 
+#ifdef IMPL_V2
+    int (*reset_lockout)(struct fingerprint_device *dev, const hw_auth_token_t *hat);
+#endif
+
     /* Reserved for backward binary compatibility */
+#ifdef IMPL_V2
+    void *reserved[3];
+#else
     void *reserved[4];
+#endif
 } fingerprint_device_t;
 
 typedef struct fingerprint_module {

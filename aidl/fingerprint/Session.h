@@ -100,6 +100,7 @@ class Session : public BnSession {
     AIBinder_DeathRecipient* mDeathRecipient;
 
     UdfpsHandler* mUdfpsHandler;
+    std::vector<int32_t> mEnumeratedEnrollments;
 };
 
 }  // namespace aidl::android::hardware::biometrics::fingerprint

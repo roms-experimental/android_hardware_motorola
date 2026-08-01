@@ -34,7 +34,7 @@ Session::Session(fingerprint_device_t* device, rbs_fingerprint_device_t* rbsDevi
       mUdfpsHandler(udfpsHandler) {
     mDeathRecipient = AIBinder_DeathRecipient_new(onClientDeath);
 
-    auto path = std::format("/data/vendor_de/{}/fpdata/", userId);
+    auto path = std::format("/data/vendor_de/{}/fpdata", userId);
     if (mAncDevice && mAncDevice->AncSetActiveGroup) {
         ALOGI("setActiveGroup (ANC)");
         int rc = mAncDevice->AncSetActiveGroup(mDevice, userId, path.c_str());
@@ -52,7 +52,11 @@ Session::Session(fingerprint_device_t* device, rbs_fingerprint_device_t* rbsDevi
             ALOGE("rbs_set_data_path failed, error: %d", rc);
         }
     } else if (mDevice) {
-        mDevice->set_active_group(mDevice, mUserId, path.c_str());
+        ALOGI("setActiveGroup: userId=%d, path=%s", mUserId, path.c_str());
+        int rc = mDevice->set_active_group(mDevice, mUserId, path.c_str());
+        if (rc != 0) {
+            ALOGE("set_active_group failed, error: %d", rc);
+        }
     }
 }
 
@@ -270,6 +274,7 @@ ndk::ScopedAStatus Session::enumerateEnrollments() {
         return ndk::ScopedAStatus::ok();
     }
 
+    mEnumeratedEnrollments.clear();
     int error = mDevice->enumerate(mDevice);
     if (error) {
         ALOGE("enumerate failed: %d", error);
@@ -327,12 +332,26 @@ ndk::ScopedAStatus Session::removeEnrollments(const std::vector<int32_t>& enroll
         return ndk::ScopedAStatus::ok();
     }
 
+#ifdef IMPL_V2
+    if (enrollmentIds.empty()) {
+        mCb->onEnrollmentsRemoved({});
+        return ndk::ScopedAStatus::ok();
+    }
+    int error = mDevice->aidl_remove(mDevice, mUserId, enrollmentIds.data(),
+                                     enrollmentIds.size());
+    if (error) {
+        ALOGE("aidl_remove failed: %d", error);
+    }
+    return ndk::ScopedAStatus::ok();
+#else
+
     for (int32_t fid : enrollmentIds) {
         int error = mDevice->remove(mDevice, mUserId, fid);
         if (error) {
             ALOGE("remove failed: %d", error);
         }
     }
+#endif
     return ndk::ScopedAStatus::ok();
 }
 
@@ -391,6 +410,16 @@ ndk::ScopedAStatus Session::resetLockout(const HardwareAuthToken& hat) {
             ALOGE("AncResetLockout failed: %d", error);
         }
     }
+#ifdef IMPL_V2
+    else if (mDevice) {
+        hw_auth_token_t authToken;
+        translate(hat, authToken);
+        int error = mDevice->reset_lockout(mDevice, &authToken);
+        if (error) {
+            ALOGE("reset_lockout failed: %d", error);
+        }
+    }
+#endif
     clearLockout(true);
     if (mIsLockoutTimerStarted) mIsLockoutTimerAborted = true;
 
@@ -698,11 +727,12 @@ void Session::notify(const fingerprint_msg_t* msg) {
         case FINGERPRINT_TEMPLATE_ENUMERATING: {
             ALOGD("onEnumerate(fid=%d, gid=%d, rem=%d)", msg->data.enumerated.finger.fid,
                   msg->data.enumerated.finger.gid, msg->data.enumerated.remaining_templates);
-            static std::vector<int> enrollments;
-            enrollments.push_back(msg->data.enumerated.finger.fid);
+            if (msg->data.enumerated.finger.fid != 0) {
+                mEnumeratedEnrollments.push_back(msg->data.enumerated.finger.fid);
+            }
             if (msg->data.enumerated.remaining_templates == 0) {
-                mCb->onEnrollmentsEnumerated(enrollments);
-                enrollments.clear();
+                mCb->onEnrollmentsEnumerated(mEnumeratedEnrollments);
+                mEnumeratedEnrollments.clear();
             }
         } break;
         case FINGERPRINT_GENERATE_CHALLENGE: {
